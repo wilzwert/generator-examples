@@ -1,0 +1,8 @@
+parameters:
+    level: max
+    paths:
+        - bin
+        - cli
+        - public
+        - src
+    tmpDir: var/cache/phpstan

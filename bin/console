@@ -1,0 +1,30 @@
+#!/usr/bin/env php
+<?php
+
+require __DIR__.'/../vendor/autoload.php';
+
+$name = $argv[1] ?? null;
+
+if (null === $name) {
+    fwrite(\STDERR, "Usage: bin/console <name>\n\n");
+    fwrite(\STDERR, "Available:\n");
+    foreach (glob(__DIR__.'/../cli/*.php') ?: [] as $file) {
+        fwrite(\STDERR, '  - '.basename($file, '.php')."\n");
+    }
+    exit(1);
+}
+
+$script = __DIR__.'/../cli/'.$name.'.php';
+
+if (!is_file($script)) {
+    fwrite(\STDERR, "Unknown command: {$name} (looked for {$script})\n");
+    exit(1);
+}
+
+// Drop the command name from $argv so the required script sees the same
+// $argv it would get invoked directly (php cli/<name>.php <its own args>) —
+// this also holds when a script recurses into itself through bin/console.
+array_splice($argv, 1, 1);
+$argc = count($argv);
+
+require $script;

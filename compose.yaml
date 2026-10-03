@@ -1,0 +1,19 @@
+services:
+  php:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    ports:
+      # http://localhost -> FrankenPHP on 8080 (unprivileged port inside the container)
+      - "80:8080"
+    environment:
+      # ":8080" keeps it plain HTTP; a hostname would make Caddy negotiate TLS.
+      SERVER_NAME: ":8080"
+      # Provider keys, taken from the host environment (or .env); empty if unset.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - .:/app
+      - ./docker/php.ini:/usr/local/etc/php/conf.d/zz-dev.ini:ro
