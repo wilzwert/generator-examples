@@ -1,3 +1,20 @@
+.PHONY: build install up down sh
+
+build:
+	docker compose build
+
+install:
+	docker compose run --rm php composer install
+
+up:
+	docker compose up -d
+
+down:
+	docker compose down
+
+sh:
+	docker compose exec php sh
+
 .PHONY: console
 
 console:

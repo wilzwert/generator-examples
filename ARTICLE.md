@@ -65,7 +65,7 @@ Important : sur un générateur pas encore démarré, `send()` l'exécute d'abor
 
 On peut également utiliser `throw()`, qui fonctionne sur le même principe que `send()`. Au lieu de fournir une valeur, il lève une exception au niveau du `yield` où le générateur est suspendu. Le générateur peut l'attraper avec un `try/catch` autour du `yield`, comme n'importe quelle exception.
 
-On reverra ces trois méthodes en section 3, où eà l'endroitlles serviront à piloter des tâches.
+On reverra ces trois méthodes en section 3, où elles serviront à piloter des tâches.
 
 ### Ce que les générateurs apportent (et ce qu'ils n'apportent pas)
 
@@ -102,7 +102,7 @@ foreach ($multiStream->run($providerNames, $prompt) as $event) {
 }
 ```
 
-`run()` renvoie un générateur, et chaque `$event` est un morceau de réponse (un `Event`) d'un des fournisseurs. Le script ne sait rien du fonctionnement interne de notre multi-stream, : il reçoit simplement des événements et les envoie au navigateur, et s'arrête si le client se déconnecte.
+`run()` renvoie un générateur, et chaque `$event` est un morceau de réponse (un `Event`) d'un des fournisseurs. Le script ne sait rien du fonctionnement interne de notre multi-stream : il reçoit simplement des événements et les envoie au navigateur, et s'arrête si le client se déconnecte.
 
 À noter : `connection_aborted()` n'est mis à jour qu'après une tentative d'envoi au client (ici le `echo` + `flush()` du tour précédent). Par ailleurs, par défaut, PHP interrompt le script dès qu'il détecte que le client s'est déconnecté. Pour que ce test serve à quelque chose, le script appelle donc `ignore_user_abort(true)` avant la boucle.
 
@@ -157,7 +157,7 @@ Chaque requête envoyée à un fournisseur est donc représentée par un `Stream
          ▼
     StreamExchange (un par fournisseur)
          ├─ MessageSplitter : octets  ──> Message  (découpage, par exemple selon le format SSE)
-         └─ MessageDecoder  : Message ──> Event    (un Event est un objet structuré qui atoute du sens à un message : morceau de texte, fin de réponse, erreur)
+         └─ MessageDecoder  : Message ──> Event    (un Event est un objet structuré qui ajoute du sens à un message : morceau de texte, fin de réponse, erreur)
 
 Le splitter et le décodeur sont fournis par un `Provider`, propre à chaque fournisseur ou modèle, qui sait aussi construire la requête HTTP à envoyer. Un registre (`ProviderRegistry`) nous permet de définir et maintenir une liste de `Provider` associés à un nom.
 
@@ -760,7 +760,7 @@ Un cas plus sournois, où une seule tâche se bloque pendant que les autres avan
 > 
 > Pour lancer l'ETL : `make console script=pipeline`
 > 
-> Pour lancer les scénarios de test  : `make console script=etl`
+> Pour lancer les scénarios de test  : `make console script="etl 100000"` (le nombre de lignes attendu doit correspondre à celui du fichier généré)
 
 ### Le besoin
 
@@ -781,11 +781,11 @@ Chaque tâche est un générateur qui produit des commandes `Receive` (lire un c
 
 | Tâche                          | Responsabilité                                                                                                                                   | Erreurs                                                                                          |
 |--------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| lecteur (`Reader`)             | **format** : lecture de fichier CSV, envoi des lignes sous forme d'`array` dans le canal 'read'                                                  | le pipeline s'arrête                                                                             |
-| transformateur (`Transformer`) | **lecture dans 'read', validation/transformation** : champs requis, montant positif, date valide... envoi d'objets `Order` dans le canal 'orders' | ligne invalide : envoi dans le canal 'rejects'                                                   |
-| groupeur (`Batcher`)           | **lecture dans 'orders', regroupement par 100** : envoi tableau d'objets `Order` dans le canal 'batches'                                         | si un élément n'est pas un `Order` : `\LogicException` : arrêt du pipeline                       |
-| écrivain (`Writer`)            | **lecture dans 'batches'** : affichage console                                                                                                   | si un lot est vide ou contient autre chose que des `Order` : `\LogicException` : arrêt du pipeline |
-| logger (`RejectLogger`)        | **lecture dans 'rejects'** : affichage console                                                                                                   | si un élément n'est pas un `Reject` : `\LogicException` : arrêt du pipeline                      |
+| lecteur (`Reader`)             | **format** : lecture de fichier CSV, envoi des lignes sous forme d'`array` dans le canal `read`                                                  | le pipeline s'arrête                                                                             |
+| transformateur (`Transformer`) | **lecture dans `read`, validation/transformation** : champs requis, montant positif, date valide... envoi d'objets `Order` dans le canal `orders` | ligne invalide : envoi dans le canal `rejects`                                                   |
+| groupeur (`Batcher`)           | **lecture dans `orders`, regroupement par 100** : envoi tableau d'objets `Order` dans le canal `batches`                                         | si un élément n'est pas un `Order` : `\LogicException` : arrêt du pipeline                       |
+| écrivain (`Writer`)            | **lecture dans `batches`** : affichage console                                                                                                   | si un lot est vide ou contient autre chose que des `Order` : `\LogicException` : arrêt du pipeline |
+| logger (`RejectLogger`)        | **lecture dans `rejects`** : affichage console                                                                                                   | si un élément n'est pas un `Reject` : `\LogicException` : arrêt du pipeline                      |
 
 
 ### Les tâches
@@ -932,11 +932,11 @@ Voici le résultat obtenu :
 
 L'interblocage n'est détecté que lorsque la file d'exécution est vide (voir section 3). Une tâche coincée pendant que les autres avancent risque donc de n'être signalée qu'à la toute fin : sur un fichier de 10 Go, potentiellement des heures plus tard.
 
-Dans un pipeline, la contre-pression change la donne. Reprenons notre ETL, avec ses canaux de capacité 10, et imaginons que le journal des rejets reste bloqué sur un autre canal que personne n'alimente. Il ne lit donc plus le canal "rejects". La suite se déroule en cascade :
+Dans un pipeline, la contre-pression change la donne. Reprenons notre ETL, avec ses canaux de capacité 10, et imaginons que le journal des rejets reste bloqué sur un autre canal que personne n'alimente. Il ne lit donc plus le canal `rejects`. La suite se déroule en cascade :
 
-1. le transformateur continue d'envoyer ses rejets, et le canal "rejects" finit par être plein ;
+1. le transformateur continue d'envoyer ses rejets, et le canal `rejects` finit par être plein ;
 2. au rejet suivant, le transformateur est mis en attente sur son `Send` ;
-3. il ne lit plus le canal 'read', que le lecteur remplit à son tour ;
+3. il ne lit plus le canal `read`, que le lecteur remplit à son tour ;
 4. le lecteur est mis en attente sur son `Send` ;
 5. le groupeur et l'écrivain ne reçoivent plus rien : ils sont, eux aussi, en attente, sur des canaux vides.
 
@@ -950,7 +950,7 @@ Toutes les tâches sont en attente, la file d'exécution se vide, et l'ordonnanc
       - transformer: waiting to send on "rejects"
 
 En testant ce scénario sur un fichier de 2 000 lignes, le lecteur n'a envoyé qu'environ 340 lignes avant la détection, et ce nombre ne dépend que des capacités des canaux et de la position des rejets dans le fichier, pas de sa taille. 
-Sans limite de capacité, le canal "rejects" aurait grossi jusqu'à la fin du fichier, et le blocage n'aurait été vu qu'à ce moment-là. 
+Sans limite de capacité, le canal `rejects` aurait grossi jusqu'à la fin du fichier, et le blocage n'aurait été vu qu'à ce moment-là. 
 C'est pour cela que nos canaux ont une capacité limitée.
 
 Cette cascade suppose que la tâche bloquée a un producteur en amont. Si elle n'est reliée à aucune autre tâche active (elle attend sur un canal que personne n'alimente, et personne ne lit ce qu'elle produit), rien ne remonte : le reste du traitement se termine normalement, et le blocage n'est détecté qu'à la fin. 
@@ -1032,7 +1032,7 @@ foreach (batch(transform(read($path)), 100) as $batch) {
 
 `read()` et `transform()` ont la même forme : un `foreach` sur l'étage précédent, un `yield` par valeur produite. Pas d'ordonnanceur, pas de canaux, pas de `Close` : la fin de flux est la fin du `foreach`, et la mémoire reste constante, puisque chaque étage ne demande la valeur suivante qu'au moment où il en a besoin.
 
-L'ordonnanceur et les canaux ne se justifient que lorsqu'on a lusieurs sorties ou plusieurs entrées (rejets, répartition vers plusieurs écrivains, fusion de plusieurs sources), ou lorsqu'on veut une contre-pression explicite entre les étages.
+L'ordonnanceur et les canaux ne se justifient que lorsqu'on a plusieurs sorties ou plusieurs entrées (rejets, répartition vers plusieurs écrivains, fusion de plusieurs sources), ou lorsqu'on veut une contre-pression explicite entre les étages.
 
 Ce que les générateurs apportent alors :
 - **un code procédural** : chaque étage est une boucle `while` avec ses variables locales, qui se lit de haut en bas. Pas de machine à états, pas de propriété "où en étais-je", pas de méthode `flush()` : la fin de flux est simplement le code qui suit la boucle ;
@@ -1044,7 +1044,7 @@ Et ce qu'apporte l'architecture canaux + ordonnanceur construite par-dessus :
 - **câblage centralisé** : aucun étage n'injecte le suivant. Le graphe est dessiné à un seul endroit, le script de câblage, et se modifie sans toucher aux étages ;
 - **mémoire bornée et contre-pression** : un producteur rapide ne peut pas inonder un consommateur lent, et la mémoire ne dépend que des capacités et de la taille des lots ;
 - **pannes visibles** : un étage oublié, un `Close` manquant ou une boucle d'attente mutuelle donnent un interblocage détecté et décrit, au lieu d'un programme qui tourne à vide ou se termine en silence.
-- **de l'amusement** (mais ça, c'est très subjectoif !) : c'est un schéma mental assez différent de ce qu'on a l'habitude de voir dans beaucoup de projets PHP
+- **de l'amusement** (mais ça, c'est très subjectif !) : c'est un schéma mental assez différent de ce qu'on a l'habitude de voir dans beaucoup de projets PHP
 
 Le prix à payer : un ordonnanceur à écrire et à comprendre (environ 250 lignes), des canaux non typés, et des erreurs d'un genre nouveau (interblocages, fin de flux oubliée). 
 Le choix se fait donc sur la forme du graphe : une ligne, une chaîne de générateurs ; un graphe, des canaux.
@@ -1055,18 +1055,18 @@ Au départ, j'utilisais des générateurs, parfois sans même le savoir, avec un
 A part l'avantage en terme d'occupation mémoire, je ne m'étais jamais vraiment posé de questions sur leur nature et leurs autres propriétés et capacités.
 
 En creusant, j'ai découvert ou approfondi des notions très intéressantes (concurrence, coroutines, inversion du flux de données...) qui sont pour certaines plus connues dans d'autres langages. 
-C'est aussi amusant de voir que, Malgré son statut d'"ancêtre" parfois très critiqué pour ses limites (réelles ou imaginaires, mais c'est un autre débat :)), PHP propose des fonctionnalités intéressantes et relativement méconnues, et dans ce cas précis depuis PHP 5.5 !
+C'est aussi amusant de voir que, malgré son statut d'"ancêtre" parfois très critiqué pour ses limites (réelles ou imaginaires, mais c'est un autre débat :)), PHP propose des fonctionnalités intéressantes et relativement méconnues, et dans ce cas précis depuis PHP 5.5 !
 
 Si je devais retenir une règle pratique de ces deux exemples, ce serait celle-ci :
 - pour produire ou transformer un flux linéaire (lire un fichier, streamer une réponse, enchaîner des étapes), un générateur consommé par un `foreach`, ou une chaîne de générateurs, suffit largement ;
-- un 'ordonnanceur et ses canaux ne valent leur prix que lorsque le traitement forme un graphe (plusieurs sorties, plusieurs entrées), ou lorsqu'on a besoin d'une contre-pression explicite entre les étapes.
+- un ordonnanceur et ses canaux ne valent leur prix que lorsque le traitement forme un graphe (plusieurs sorties, plusieurs entrées), ou lorsqu'on a besoin d'une contre-pression explicite entre les étapes.
 
 Dans les deux cas, les générateurs ne rendent rien plus rapide par eux-mêmes : ils structurent le code, gardent la mémoire sous contrôle, et laissent le consommateur décider du rythme et de l'arrêt.
 
 Avec un peu de recul, ces deux exemples ressemblent à des sortes de boucles d'événements en miniature. La boucle `curl_multi_exec()` / `curl_multi_select()` du multi-stream attend des I/O réseau, et l'ordonnanceur de l'ETL fait tourner des tâches qui rendent la main à chaque `yield` et se réveillent quand une valeur ou une place arrive dans un canal ; une vraie boucle d'événements comme Revolt ou ReactPHP réunit simplement les deux : elle attend des I/O réelles (sockets, timers) et relance les tâches concernées.
 
 Pour un ordonnanceur en production, il est intéressant de se tourner vers des outils éprouvés (plutôt que réinventer une roue pas tout à fait ronde :)). Par exemple :
-- [AMPHP](https://amphp.org/), asynchrone en PHP, construite sur la boucle d'événements Revolt. Son paquet [`amphp/pipeline`](https://github.com/amphp/pipeline) propose des files avec contre-pression, très proches de nos canaux. AU passage, jusqu'à sa version 2, AMPHP reposait justement sur des générateurs ;
+- [AMPHP](https://amphp.org/), une bibliothèque asynchrone pour PHP, construite sur la boucle d'événements Revolt. Son paquet [`amphp/pipeline`](https://github.com/amphp/pipeline) propose des files avec contre-pression, très proches de nos canaux. Au passage, jusqu'à sa version 2, AMPHP reposait justement sur des générateurs ;
 - [ReactPHP](https://reactphp.org/), une boucle d'événements, des flux avec contre-pression et des promesses ;
 - [Swoole](https://www.swoole.com/) / [OpenSwoole](https://openswoole.com/), des extensions C qui apportent de vraies coroutines et une classe `Channel` avec capacité, quasiment le modèle de la section 3 ;
 - [Flow PHP](https://flow-php.com/), un framework ETL qui traite les données en flux, à base de générateurs, avec une mémoire bornée : notre section 4, en version industrielle.
