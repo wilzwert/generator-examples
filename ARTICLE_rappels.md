@@ -1,6 +1,6 @@
 # Rappels sur les générateurs PHP
 
-> Cet article complète [Générateurs PHP : itération paresseuse, flux et orchestration de tâches](ARTICLE.md). Il regroupe les rappels de base sur les générateurs, ainsi qu'un petit benchmark mémoire.
+> Cet article complète [Générateurs PHP : itération paresseuse, flux et orchestration de tâches](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE.md). Il regroupe les rappels de base sur les générateurs, ainsi qu'un petit benchmark mémoire.
 
 Selon la [référence du langage PHP](https://www.php.net/manual/fr/language.generators.overview.php) :
 
@@ -100,7 +100,7 @@ Enfin, `throw()` fonctionne sur le même principe que `send()`, mais au lieu de 
 
 Une coroutine est une fonction qui peut suspendre son exécution, puis la reprendre plus tard là où elle s'était arrêtée, en conservant son état. Selon cette définition, tout générateur est déjà une coroutine. `send()` ajoute la communication dans l'autre sens : le générateur ne se contente plus de produire des valeurs, il peut aussi en recevoir de celui qui le relance.
 
-On reverra ces trois méthodes dans [l'article principal](ARTICLE.md), où elles servent à piloter des tâches.
+On reverra ces trois méthodes dans [l'article principal](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE.md), où elles servent à piloter des tâches.
 
 ## Relayer les valeurs d'un autre iterable : `yield from`
 

@@ -7,7 +7,9 @@ Généralement, on repart de ces événements avec le cerveau bouillonnant d'id�
 Au fur et à mesure de la présentation, en plus de la découverte de l'architecture de la stack LLM Semji, de ses abstractions et de ses évolutions, j'ai en particulier remarqué une utilisation intensive de l'instruction `yield` et des `Generator`, dans le contexte entre autres de streaming de réponses.
 J'ai ainsi pris conscience que je n'en avais pas croisé énormément dans les codebases sur lesquelles j'ai travaillé, et surtout que je n'avais jamais réellement approfondi ce que sont les générateurs et coroutines (honte sur moi).
 
-Cet article vise donc à présenter 2 exemples concrets d'utilisation de générateurs : streamer de multiples réponses de LLM (via SSE) et créer une pseudo-pipeline ETL sur un fichier CSV. 
+Cet article vise donc à présenter 2 exemples concrets d'utilisation de générateurs : streamer de multiples réponses de LLM (via SSE) et créer une pseudo-pipeline ETL sur un fichier CSV.
+
+Le second exemple demande un peu d'outillage : un petit système de coroutines (tâches, canaux, ordonnanceur), présenté de façon condensée en section 3, puis utilisé en section 4 pour l'ETL. Sa construction pas à pas, avec le code de chaque pièce, fait l'objet d'[un article à part](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_ordonnanceur.md).
 
 > Tout le code de ce projet d'apprentissage est disponible ici : https://github.com/wilzwert/generator-examples
 
@@ -17,55 +19,12 @@ Cet article vise donc à présenter 2 exemples concrets d'utilisation de génér
 
 ## 1. L'essentiel à savoir
 
-Si les générateurs ne vous sont pas familiers, j'ai regroupé des rappels (évaluation paresseuse, `yield from`, nettoyage avec `finally`...) et un benchmark dans [un article à part](ARTICLE_rappels.md). Je reprends ici ce qui est essentiel pour la suite. 
+Si les générateurs ne vous sont pas familiers, j'ai regroupé des rappels (évaluation paresseuse, `send()` et `throw()`, `yield from`, nettoyage avec `finally`...) et un benchmark dans [un article à part](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_rappels.md).
 
-Une fonction qui contient `yield` renvoie un `Generator` : son corps ne s'exécute qu'au fil de la consommation, une valeur à la fois, et son état (ses variables locales) est conservé entre deux valeurs.
-
-Moins connu : un générateur peut aussi recevoir des données. C'est l'appelant qui les lui envoie avec sa méthode `send()`.
-
-Un générateur est une coroutine : une fonction qui peut suspendre son exécution, puis la reprendre là où elle s'était arrêtée.
-
-Voici un petit récapitulatif des manières dont on peut utiliser `yield` :
-
-    yield;                    suspend l'exécution, produit null
-    yield $value;             suspend l'exécution, produit $value
-    $received = yield;        suspend, produit null, puis reçoit la valeur passée à send()
-    $received = yield $value; suspend, produit $value, puis reçoit la valeur passée à send()
-
-Petit exemple : un générateur qui tient un total cumulé, et à qui on envoie des montants.
-
-```php
-function runningTotal(): \Generator
-{
-    $total = 0;
-    while (true) {
-        $amount = yield $total;
-        $total += $amount;
-    }
-}
-
-$gen = runningTotal();
-echo $gen->current(), "\n";
-echo $gen->send(10), "\n";
-echo $gen->send(5), "\n";
-```
-
-Sortie :
-
-    0
-    10
-    15
-
-Il se passe pas mal de choses ici :
-- `current()` démarre le générateur : son corps s'exécute jusqu'au premier `yield`, qui produit `0` (le total initial) ;
-- `send(10)` fait trois choses d'un coup : il relance le générateur, donne la valeur `10` à l'expression `yield` (qui se retrouve dans `$amount`), puis laisse le générateur s'exécuter jusqu'au `yield` suivant, dont il renvoie la valeur (`10`) ;
-- entre deux appels, `$total` est conservé : c'est une simple variable locale, que le générateur garde tant qu'il est suspendu.
-
-Important : sur un générateur pas encore démarré, `send()` l'exécute d'abord jusqu'au premier `yield`, puis envoie sa valeur. La valeur produite par ce premier `yield` (ici le `0`) est alors perdue pour l'appelant. D'où l'appel à `current()` en premier.
-
-On peut également utiliser `throw()`, qui fonctionne sur le même principe que `send()`. Au lieu de fournir une valeur, il lève une exception au niveau du `yield` où le générateur est suspendu. Le générateur peut l'attraper avec un `try/catch` autour du `yield`, comme n'importe quelle exception.
-
-On reverra ces trois méthodes en section 3, où elles serviront à piloter des tâches.
+Pour la suite, trois points suffisent :
+- une fonction qui contient `yield` renvoie un `Generator`, dont le corps ne s'exécute qu'au fil de la consommation, en conservant ses variables locales entre deux valeurs ;
+- un générateur peut aussi recevoir des valeurs (`send()`) ou des exceptions (`throw()`) au niveau du `yield` où il est suspendu ;
+- c'est donc une coroutine : une fonction qui peut suspendre son exécution, puis la reprendre là où elle s'était arrêtée.
 
 ### Ce que les générateurs apportent (et ce qu'ils n'apportent pas)
 
@@ -283,13 +242,9 @@ Ce que le générateur apporte :
 Dans notre exemple précédent, on a un seul producteur et un seul consommateur ; même si notre multi-stream permet de déléguer bon nombre de traitements à d'autres générateurs via nos splitters et decoders, il reste aussi le seul point d'accès aux données, qui sont consommées par un simple foreach. 
 On n'a donc pas de notion de "communication" entre plusieurs générateurs.
 
-> Avant d'aller plus loin, une petite précision : tout ce qui suit s'inspire énormément de l'article de Nikita Popov, [Cooperative multitasking using coroutines (in PHP!)](https://www.npopov.com/2012/12/22/Cooperative-multitasking-using-coroutines-in-PHP.html), écrit en 2012 au moment de l'arrivée des générateurs dans PHP 5.5. On y retrouve déjà une tâche qui enveloppe un générateur, une file d'exécution, des tâches qui produisent des demandes avec `yield` (ses `SystemCall`), et `throw()` pour leur renvoyer une erreur.
->
-> Nos objectifs sont toutefois différents. Popov construit une sorte de mini système d'exploitation : les tâches peuvent connaître leur identifiant, en créer d'autres ou les tuer, attendre des sockets avec `stream_select()`, et il termine sur un petit serveur HTTP non bloquant. Il gère aussi à la main les appels entre coroutines, puisque `yield from` n'existait pas encore. 
->
-> De mon côté, il s'agit d'un projet différent et conceptuellement bien plus simple : je me suis concentré sur la communication basique entre tâches, avec des canaux de capacité limitée, une forme de contre-pression, la fin de flux et la détection d'interblocage.
->
-> Rappelons qu'il s'agit d'un projet d'apprentissage : le but était de reprendre certaines des idées de Popov pour mieux les comprendre, en les appliquant à un autre problème. Je me suis également inspiré de certaines notions découvertes en lisant (sans totalement comprendre :D) des articles sur les Goroutines ou les coroutines en Kotlin.
+> Cette section présente le système de façon condensée, avec ce qui est utile pour l'ETL de la section 4. La construction pas à pas, avec le code de chaque pièce, les déroulés tour par tour et la gestion des erreurs, se trouve dans [un article à part](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_ordonnanceur.md).
+
+> Tout ce qui suit s'inspire énormément de l'article de Nikita Popov, [Cooperative multitasking using coroutines (in PHP!)](https://www.npopov.com/2012/12/22/Cooperative-multitasking-using-coroutines-in-PHP.html), écrit en 2012 au moment de l'arrivée des générateurs dans PHP 5.5. Popov y construit une sorte de mini système d'exploitation ; je me suis concentré, dans ce projet d'apprentissage, sur la communication entre tâches : canaux de capacité limitée, contre-pression, fin de flux et détection d'interblocage.
 
 Nous allons voir ici comment on peut justement imaginer un système de coroutines coopératives très simplifié, ici pour un ETL dont le rôle sera simplement de :
 - lire un fichier CSV (une ligne à la fois)
@@ -311,87 +266,18 @@ Plusieurs termes proches vont revenir ; voici le sens précis qu'ils auront dans
 
 > Le code complet se trouve dans `src/Pipeline`. 
 
-### Le canal
+### Les canaux
 
 Un canal est à voir comme une sorte de tapis roulant : une tâche peut déposer une valeur sur le tapis, et une autre tâche peut la récupérer pour la traiter. Les valeurs ressortent dans l'ordre où elles sont entrées (FIFO).
 
 Un canal a trois composants :
 - un **buffer** : les valeurs envoyées dans le canal mais pas encore consommées ;
-- une **capacité** : quand le buffer est plein, le producteur doit attendre. C'est la **contre-pression** (backpressure) : un producteur rapide ne peut pas inonder un consommateur lent, et la mémoire reste bornée. C'est l'ordonnanceur qui met le producteur en attente, puis le réveille quand une place se libère ;
+- une **capacité** : quand le buffer est plein, le producteur doit attendre. C'est la **contre-pression** (backpressure) : un producteur rapide ne peut pas inonder un consommateur lent, et la mémoire reste bornée ;
 - un état **fermé** : le producteur annonce qu'il n'enverra plus rien.
 
-Un certain nombre de règles doivent s'appliquer : ne pas accepter de données sur un canal fermé, ne pas permettre de lire des données sur un canal vide, etc. `Channel` ne gère ici que ses propres règles internes, et lève une exception en cas de "mauvais" appel. L'ordonnanceur vérifie l'état du canal (`isClosed()`, `isFull()`, `isEmpty()`) avant chaque opération, pour ne jamais faire d'appel invalide. Ces exceptions sont donc un garde-fou : si l'une d'elles est levée, c'est le signe d'un bug, et elle interrompt l'ensemble du traitement.
+Fermé n'est pas vide : après sa fermeture, un canal peut encore contenir des valeurs que le consommateur n'a pas récupérées. La vraie fin du flux, pour le consommateur, est le canal **épuisé** (fermé et vide). Envoyer `null` dans un canal est interdit : c'est par choix la valeur donnée à un consommateur quand le canal est épuisé.
 
-Voici l'essentiel de la classe (le reste, comme `isFull()`, `isEmpty()` ou `isClosed()`, est dans le dépôt) :
-
-```php
-class Channel
-{
-    /**
-     * @var \SplQueue<mixed>
-     */
-    private \SplQueue $queue;
-
-    private bool $closed = false;
-
-    public function __construct(public readonly int $capacity, public readonly string $name = '')
-    {
-        // ... vérifie que la capacité vaut au moins 1
-        $this->queue = new \SplQueue();
-    }
-
-    public function push(mixed $value): void
-    {
-        if (null === $value) {
-            throw new \LogicException('Value cannot be null');
-        }
-
-        if ($this->isClosed()) {
-            throw new \LogicException('Channel is closed');
-        }
-
-        if ($this->isFull()) {
-            throw new \LogicException('Channel is full');
-        }
-
-        $this->queue->enqueue($value);
-    }
-
-    public function shift(): mixed
-    {
-        if ($this->isEmpty()) {
-            throw new \LogicException('Channel is empty');
-        }
-
-        return $this->queue->shift();
-    }
-
-    public function close(): void
-    {
-        if ($this->closed) {
-            throw new \LogicException('Channel already closed');
-        }
-
-        $this->closed = true;
-    }
-
-    public function isDrained(): bool
-    {
-        return $this->isClosed() && $this->isEmpty();
-    }
-}
-```
-
-
-#### Fermé n'est pas vide
-
-`close()` signifie que les écritures ne peuvent plus s'effectuer, mais pas que le buffer doit être immédiatement vidé. Étant donné que le producteur ferme son canal juste après son dernier envoi, vider le buffer avant que le consommateur ait pu récupérer les données entraînerait des pertes. 
-On a donc 2 états : 
-- **fermé** : le producteur a indiqué avoir terminé, mais des valeurs peuvent rester dans le buffer ;
-- **épuisé** (fermé et vide) : la vraie fin du flux du point de vue du consommateur.
-
-Dans notre exemple, envoyer `null` dans un canal est interdit, car c'est par choix la valeur qui est donnée à un consommateur quand le canal est épuisé. 
-Ce cas est vérifié dès la construction de la commande : `new Send($channel, null)` lève une `LogicException`. 
+`Channel` lève une exception en cas d'appel invalide (envoi sur un canal fermé ou plein, lecture sur un canal vide...). L'ordonnanceur vérifie l'état du canal avant chaque opération : ces exceptions sont donc un garde-fou, et si l'une d'elles est levée, c'est le signe d'un bug.
 
 ### Les commandes
 
@@ -411,31 +297,12 @@ function consumer(Channel $in): \Generator
 }
 ```
 
-Le type `\Generator<int, Command, mixed, void>` décrit, dans l'ordre : le type des clés, celui des valeurs produites par `yield`, celui des valeurs reçues par `send()`, et celui de la valeur renvoyée par `return`. Il permet à PHPStan de signaler un générateur qui produirait des données avec yield sans les envelopper dans une `Command`. Cette vérification est uniquement statique : à l'exécution, rien n'empêche une tâche de produire autre chose qu'une `Command`, c'est pourquoi l'ordonnanceur le vérifie aussi.
 
-### Les tâches : un générateur et son état
+Le type `\Generator<int, Command, mixed, void>` (clés, valeurs produites par `yield`, valeurs reçues par `send()`, valeur de `return`) permet à PHPStan de signaler une tâche qui produirait autre chose qu'une `Command`. Cette vérification n'est que statique : l'ordonnanceur la refait à l'exécution.
 
-Une tâche implémente une interface simple : 
+### Les tâches : piloter un générateur
 
-```php
-interface Task
-{
-    public string $id { get; }
-
-    public function resume(): ?Command;
-
-    public function getStatus(): TaskStatus;
-
-    public function resumeWith(mixed $data): void;
-
-    public function failWith(\Throwable $throwable): void;
-}
-```
-Pour le moment, une seule implémentation `GeneratorTask` qui encapsule un générateur. Ainsi l'ordonnanceur n'a pas directement connaissance de la véritable nature des tâches. Initialement, je voulais également pouvoir créer d'autres types d'implémentations pour voir leurs différents impacts, mais j'ai renoncé pour conserver ma santé mentale (et mes cheveux).  
-
-#### Piloter une tâche à la main
-
-Avant de regarder `GeneratorTask`, voyons ce que l'ordonnanceur devra faire, en pilotant nous-mêmes la tâche `consumer()` vue plus haut :
+Voyons ce que l'ordonnanceur devra faire, en pilotant nous-mêmes la tâche `consumer()` :
 
 ```php
 $task = consumer(new Channel(1, 'in'));
@@ -449,52 +316,11 @@ var_dump($task->valid());     // bool(false) : la tâche est terminée
 Ici, c'est nous qui jouons le rôle de l'ordonnanceur : on lit la commande produite, on décide de la réponse, et on relance la tâche avec. 
 Pour signaler une erreur (par exemple un envoi sur un canal fermé), on aurait appelé `throw()` à la place de `send()`.
 
-`GeneratorTask` n'est rien d'autre que l'automatisation de ce pilotage. Avec une différence : l'ordonnanceur décide de la réponse à un moment donné (par exemple quand une valeur arrive dans le canal), mais la tâche ne sera relancée que plus tard, quand son tour viendra dans la file d'exécution. 
-`GeneratorTask` mémorise donc cette réponse en attendant, en plus de l'état de la tâche (non démarrée, en cours, terminée).
+La classe `GeneratorTask` automatise ce pilotage. Elle enveloppe le générateur, mémorise son état (non démarrée, en cours, terminée), ainsi que la valeur ou l'exception à lui transmettre : l'ordonnanceur décide de la réponse à un moment donné, mais la tâche ne sera relancée que plus tard, quand son tour viendra.
 
-```php
-public function resume(): ?Command
-{
-    if (TaskStatus::DONE === $this->status) {
-        throw new \LogicException('Cannot resume a finished task');
-    }
+### L'ordonnanceur
 
-    if (TaskStatus::NOT_STARTED === $this->status) {
-        $this->status = TaskStatus::STARTED;
-        $next = $this->generator->current();
-    } elseif (null !== $this->failWith) {
-        /** @var ?Command $next */
-        $next = $this->generator->throw($this->failWith);
-        $this->failWith = null;
-    } else {
-        $next = $this->generator->send($this->resumeWith);
-        $this->resumeWith = null;
-    }
-
-    // a generator only knows it is finished once resumed past its last yield:
-    // in that case $next is not a yielded value, just null
-    if (!$this->generator->valid()) {
-        $this->status = TaskStatus::DONE;
-    }
-
-    return $next;
-}
-```
-
-On retrouve nos appels manuels : `current()` au premier tour, `throw()` si une erreur est en attente, `send()` sinon, puis `valid()` pour savoir si la tâche est terminée. Les méthodes `resumeWith()` et `failWith()` de l'interface se contentent de stocker la valeur ou l'exception qui sont consommées au prochain appel de `resume()`.
-
-### L'ordonnanceur : tour de rôle, mise en attente, réveil
-
-Les tâches sont confiées à l'ordonnanceur avec sa méthode `spawn($id, $generator)`, qui enveloppe le générateur dans une `GeneratorTask` et la place dans la file d'exécution. 
-L'identifiant sert uniquement aux messages d'erreur ; deux tâches ne peuvent pas avoir le même.
-
-Le point d'entrée d'exécution de l'ordonnanceur est très simple. Il s'agit d'une boucle qui itère sur les tâches en cours :
-- prendre la prochaine tâche de la file
-- la relancer
-- vérifier son état (une tâche terminée n'envoie pas de commande, et n'a pas besoin d'être remise dans la file d'exécution)
-- prendre en charge la `Command` produite par la tâche
-
-Voici une version simplifiée (le code réel vérifie en plus que la tâche a bien produit une `Command`) :
+Les tâches sont confiées à l'ordonnanceur avec sa méthode `spawn($id, $generator)`, qui enveloppe le générateur dans une `GeneratorTask` et la place dans la file d'exécution. Sa boucle principale prend la prochaine tâche de la file, la relance, et prend en charge la `Command` qu'elle a produite (version simplifiée) :
 
 ```php
 public function run(): void
@@ -519,41 +345,13 @@ public function run(): void
 }
 ```
 
-#### Équité : la tâche repasse en fin de file
+L'ordonnancement est **coopératif** : l'ordonnanceur ne peut pas interrompre une tâche, c'est elle qui rend la main avec un `yield`. Chaque tâche n'effectue qu'une action par tour, puis repasse en fin de file, pour qu'aucune ne monopolise l'exécution.
 
-L'ordonnancement est **coopératif** : l'ordonnanceur ne peut pas interrompre les tâches, ce sont les tâches elles-mêmes qui doivent rendre la main avec un `yield`. Bien sûr, une tâche qui effectue un calcul long et complexe à son tour bloque l'ensemble des tâches : il n'y a pas de système de préemption ou d'interruption possible ici.
-
-Chaque tâche n'effectue qu'une action maximum lors de son tour, puis est remise à la fin de la file d'exécution ; ainsi on évite qu'une tâche produise une donnée puis soit relancée immédiatement et monopolise l'exécution.
-
-#### Mettre une tâche en attente
-
-Quand une tâche ne peut pas avancer, c'est-à-dire lorsque sa `Command` ne peut être traitée immédiatement (`Send` sur un canal plein, `Receive` sur un canal vide), l'ordonnanceur la **met en attente** : il ne la remet pas dans la file d'exécution, et la range dans une file d'attente propre au canal concerné.
-
-Pour chaque canal, l'ordonnanceur tient en fait deux files d'attente :
-- les **récepteurs** en attente d'une valeur ;
-- les **émetteurs** en attente d'une place, avec la valeur qu'ils veulent envoyer (c'est le rôle de la petite classe `ParkedSender` : une tâche et sa valeur).
-
-Une tâche en attente n'est plus relancée, jusqu'à ce qu'une autre tâche fasse évoluer le canal et que l'ordonnanceur la réveille.
+Quand une commande ne peut pas être traitée tout de suite (`Send` sur un canal plein, `Receive` sur un canal vide), la tâche est **mise en attente** : l'ordonnanceur la range dans une file d'attente propre au canal, une pour les récepteurs, une pour les émetteurs (avec la valeur qu'ils veulent envoyer). Elle n'est plus relancée jusqu'à ce qu'une autre tâche fasse évoluer le canal.
 
 #### Un déroulé tour par tour
 
-Déroulons l'exécution sur deux cas minimaux, avec un canal de capacité 1. Les traces ont été vérifiées avec le vrai `Scheduler`.
-
-**Premier cas : le consommateur attend.** Le consommateur `C` lit le canal jusqu'à la fin du flux, avec la boucle `while` vue plus haut. Le producteur `P` envoie `'a'`, puis ferme le canal. `C` est confié à l'ordonnanceur en premier.
-
-| Tour | Tâche relancée   | Commande produite | Ce que fait l'ordonnanceur                                                         | Canal       | File d'exécution après le tour |
-|------|------------------|-------------------|------------------------------------------------------------------------------------|-------------|--------------------------------|
-| 0    |                  |                   | tâches confiées dans l'ordre C, P                                                  | vide        | C, P                           |
-| 1    | C                | `Receive`         | canal vide : `C` est mis en attente                                                | vide        | P                              |
-| 2    | P                | `Send 'a'`        | dépose `'a'` ; un récepteur attend : `C` est réveillé avec `'a'` ; `P` est réveillé | vide        | C, P                           |
-| 3    | C (reçoit `'a'`) | `Receive`         | canal vide : `C` est de nouveau mis en attente                                     | vide        | P                              |
-| 4    | P                | `Close`           | ferme le canal ; `C` est réveillé avec `null` ; `P` est réveillé                   | vide, fermé | C, P                           |
-| 5    | C (reçoit `null`)| aucune            | fin de flux : la boucle se termine, `C` est terminée                               | vide, fermé | P                              |
-| 6    | P                | aucune            | `P` est terminée                                                                   | vide, fermé | (vide)                         |
-
-La file d'exécution est vide et plus aucune tâche n'est en attente : le traitement est terminé. Au tour 2, `'a'` ne reste pas dans le canal : il est aussitôt remis au récepteur qui attendait. Le réveil avec `null` du tour 4 est détaillé plus bas, avec la fin du flux.
-
-**Second cas : un producteur attend.** Deux producteurs `P1` et `P2` envoient chacun une valeur dans le même canal, et le consommateur `C` en lit deux. Cette fois, les producteurs sont lancés en premier.
+Deux producteurs `P1` et `P2` envoient chacun une valeur dans un canal de capacité 1, et le consommateur `C` en lit deux. Les producteurs sont lancés en premier. Les traces ont été vérifiées avec le vrai `Scheduler`.
 
 | Tour | Tâche relancée   | Commande produite | Ce que fait l'ordonnanceur                                                                          | Canal   | File d'exécution après le tour |
 |------|------------------|-------------------|-----------------------------------------------------------------------------------------------------|---------|--------------------------------|
@@ -566,24 +364,9 @@ La file d'exécution est vide et plus aucune tâche n'est en attente : le traite
 | 6    | P2               | aucune            | `P2` est terminée                                                                                   | vide    | C                              |
 | 7    | C (reçoit `'b'`) | aucune            | `C` est terminée                                                                                    | vide    | (vide)                         |
 
-#### Réveiller des tâches
+La règle principale : relancer une tâche signifie que sa dernière commande est terminée. Au tour 3, l'ordonnanceur ne peut donc pas se contenter de remettre `P2` dans la file d'exécution : il doit d'abord déposer sa valeur `'b'` dans le canal, sinon elle serait perdue silencieusement. De la même façon, un récepteur en attente n'est réveillé qu'avec une valeur, la plus ancienne disponible dans le canal.
 
-Ces deux déroulés montrent la règle principale : relancer une tâche signifie que sa dernière commande est terminée. Au tour 3 du second cas, l'ordonnanceur ne peut donc pas se contenter de remettre `P2` dans la file d'exécution : il doit d'abord déposer sa valeur `'b'` dans le canal, sinon elle serait perdue silencieusement. De la même façon, un récepteur en attente n'est réveillé qu'avec une valeur : la plus ancienne disponible dans le canal.
-
-Dans les deux cas, on réveille la tâche qui attend depuis le plus longtemps : on lui indique avec quelle valeur elle sera relancée, et on la remet dans la file d'exécution. C'est le rôle de la méthode `answer()` :
-
-```php
-/**
- * Resumes the task with a value on its next turn.
- */
-private function answer(Task $task, mixed $value = null): void
-{
-    $task->resumeWith($value);
-    $this->queue->enqueue($task);
-}
-```
-
-Voici le traitement d'un `Send` :
+Voici le traitement d'un `Send` (`answer()` mémorise la valeur de réveil de la tâche et la remet dans la file d'exécution) :
 
 ```php
 private function handleSend(Task $task, Send $command): void
@@ -597,7 +380,7 @@ private function handleSend(Task $task, Send $command): void
     }
     
     if ($channel->isFull()) {
-        // canal plein : l'émetteur est mis en attente avec sa valeur (tour 2 du second cas) ;
+        // canal plein : l'émetteur est mis en attente avec sa valeur (tour 2 du déroulé)
         $this->parkedSendersOf($channel)->enqueue(new ParkedSender($task, $command->payload));
 
         return;
@@ -608,7 +391,6 @@ private function handleSend(Task $task, Send $command): void
 
     if (!$this->parkedReceiversOf($channel)->isEmpty()) {
         // si un récepteur attendait, il est réveillé avec la plus ancienne valeur du canal
-        // (tour 2 du premier cas).
         $this->answer($this->parkedReceiversOf($channel)->dequeue(), $channel->shift());
     }
 
@@ -616,108 +398,26 @@ private function handleSend(Task $task, Send $command): void
 }
 ```
 
+
 Le traitement d'un `Receive` est le symétrique :
+- canal vide : le récepteur est mis en attente ;
+- sinon, il est réveillé avec la plus ancienne valeur, et la place libérée revient à l'émetteur qui attend depuis le plus longtemps : sa valeur est déposée, puis il est réveillé (tour 3 du déroulé).
 
-```php
-private function handleReceive(Task $task, Receive $command): void
-{
-    $channel = $command->channel;
+En cas d'erreur, l'ordonnanceur procède de la même façon, mais demande à la tâche d'échouer à son prochain tour : `throw()` lève l'exception au niveau de son `yield`, où elle peut la traiter, ou libérer ses ressources dans un `finally`.
 
-    if ($channel->isDrained()) {
-        // canal épuisé (fermé et vide) : le récepteur est réveillé avec `null`, c'est la fin du flux
-        $this->answer($task);
-
-        return;
-    }
-
-    if ($channel->isEmpty()) {
-        // canal vide : le récepteur est mis en attente (tours 1 et 3 du premier cas) ;
-        $this->parkedReceiversOf($channel)->enqueue($task);
-
-        return;
-    }
-
-    // réveil avec la plus ancienne valeur
-    $this->answer($task, $channel->shift());
-
-    // la place libérée revient à l'émetteur qui attend depuis le plus longtemps : sa valeur est déposée,
-    // puis il est réveillé (tour 3 du second cas).
-    if (!$this->parkedSendersOf($channel)->isEmpty()) {
-        $sender = $this->parkedSendersOf($channel)->dequeue();
-        $channel->push($sender->value);
-        $this->answer($sender->task);
-    }
-}
-```
-
-`parkedSendersOf()` et `parkedReceiversOf()` renvoient simplement les deux files d'attente du canal.
-
-#### Gérer les erreurs
-
-Comme on l'a vu juste au-dessus, en cas d'erreur le `Scheduler` appelle sa méthode `fail` :
-
-```php
-/**
- * Raises an exception at the task's yield on its next turn.
- */
-private function fail(Task $task, string $message): void
-{
-    $task->failWith(new \LogicException($message));
-    $this->queue->enqueue($task);
-}
-```
-
-De la même manière qu'on réveille une tâche en lui fournissant la valeur à utiliser lors de son prochain tour, on demande ici à la tâche d'échouer à son prochain tour en lui passant un `Throwable`. La tâche, une fois son tour venu, pourra gérer spécifiquement l'erreur et/ou utiliser `finally` pour par exemple nettoyer des ressources (descripteurs de fichiers, connexions externes...).
-
-#### L'état d'une tâche est local
-
-Une tâche en attente garde tout son état jusqu'à ce qu'elle soit réveillée. L'ordonnanceur n'en sait rien et n'a rien à sauvegarder. 
-C'est ce qui permet d'écrire des boucles simples dans les tâches, et on le verra plus loin avec le `Batcher` de notre ETL de démo, dont le buffer est une simple variable locale.
-
-Le wrapper `GeneratorTask` n'ajoute que ce dont l'ordonnanceur a besoin autour du générateur : son statut, et la valeur ou l'erreur à lui transmettre à son prochain tour. Tout l'état métier (compteurs, buffers...) reste dans les variables locales du générateur.
-
+Enfin, une tâche en attente garde tout son état (compteurs, buffers...) dans les variables locales de son générateur : l'ordonnanceur n'a rien à sauvegarder.
 
 ### La fin du flux : réveiller avec `null`
 
 Une tâche consommatrice ne sait pas combien de valeurs vont arriver. Elle lit donc jusqu'à la fin du flux, avec la boucle `while (null !== ($value = yield new Receive($in)))` vue plus haut.
 
-Quand un canal est épuisé (fermé et vide), l'ordonnanceur répond `null` au `Receive`. L'expression `yield` vaut `null`, la boucle se termine, et la tâche exécute **le code qui suit la boucle** : vider ce qui reste, fermer ses propres canaux de sortie. La fin du flux se propage donc.
+Quand un canal est épuisé (fermé et vide), l'ordonnanceur répond `null` au `Receive`. La boucle se termine, et la tâche exécute **le code qui suit la boucle** : vider ce qui reste, fermer ses propres canaux de sortie. La fin du flux se propage donc d'étage en étage.
 
-À la fermeture d'un canal, l'ordonnanceur réveille **tous** les récepteurs en attente avec `null` (alors qu'un `Send` n'en réveille qu'un) : s'ils attendent, le buffer est vide, donc le canal est désormais épuisé pour chacun d'eux. Les émetteurs encore en attente, eux, reçoivent une erreur : leur valeur ne pourra jamais être livrée.
+À la fermeture d'un canal (commande `Close`) :
+- **tous** les récepteurs en attente sont réveillés avec `null` : s'ils attendent, le buffer est vide, donc le canal est désormais épuisé pour chacun d'eux ;
+- les émetteurs encore en attente reçoivent une erreur : leur valeur ne pourra jamais être livrée.
 
-```php
-private function handleClose(Task $task, Close $command): void
-{
-    $channel = $command->channel;
-
-    if ($channel->isClosed()) {
-        $this->fail($task, 'Channel already closed');
-
-        return;
-    }
-
-    $channel->close();
-
-    // parked receivers imply an empty buffer: the channel is now drained, answer with end of stream
-    $receivers = $this->parkedReceiversOf($channel);
-    while (!$receivers->isEmpty()) {
-        $this->answer($receivers->dequeue());
-    }
-
-    // parked senders can never deliver their value
-    $senders = $this->parkedSendersOf($channel);
-    while (!$senders->isEmpty()) {
-        $this->fail($senders->dequeue()->task, 'Channel closed while sending.');
-    }
-
-    $this->answer($task);
-}
-```
-
-Le `Close` est indispensable parce que, du côté du consommateur, un canal vide à un instant T ne signifie pas que le canal ne recevra jamais de donnée.
-Fermer explicitement un canal est donc le seul moyen fiable d'informer ses consommateurs.
-
-À noter : fermer deux fois le même canal n'arrête pas tout le pipeline, seule la tâche fautive reçoit une erreur.
+Le `Close` est indispensable : du côté du consommateur, un canal vide à un instant T ne signifie pas que le canal ne recevra jamais de donnée.
 
 ### Détecter l'interblocage
 
@@ -1081,8 +781,10 @@ Les deux outils ne répondent donc pas aux mêmes besoins. Les générateurs res
 
 ## Pour aller plus loin
 
-- [Rappels sur les générateurs PHP](ARTICLE_rappels.md), l'annexe de cet article : bases, `yield from`, nettoyage avec `finally` et benchmark mémoire tableau contre générateur ;
+- [Rappels sur les générateurs PHP](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_rappels.md), l'annexe de cet article : bases, `yield from`, nettoyage avec `finally` et benchmark mémoire tableau contre générateur ;
+- [Construire un ordonnanceur de coroutines avec des générateurs PHP](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_ordonnanceur.md), la construction détaillée du système de la section 3 : canaux, tâches, ordonnanceur, fin de flux et interblocage ;
 - [Présentation des générateurs](https://www.php.net/manual/fr/language.generators.overview.php), dans le manuel PHP ;
 - [Syntaxe des générateurs](https://www.php.net/manual/fr/language.generators.syntax.php) : `yield`, `yield from`, clés, valeurs renvoyées ;
 - [La classe `Generator`](https://www.php.net/manual/fr/class.generator.php) et ses méthodes (`current()`, `send()`, `throw()`...) ;
+- Doeke Norg, [Exploring Coroutines in PHP](https://doeken.org/blog/coroutines-in-php)
 - Nikita Popov, [Cooperative multitasking using coroutines (in PHP!)](https://www.npopov.com/2012/12/22/Cooperative-multitasking-using-coroutines-in-PHP.html) (2012) : la référence historique sur un ordonnanceur construit avec des générateurs, très proche de notre section 3 ;
