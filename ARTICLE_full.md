@@ -1087,5 +1087,5 @@ Les deux outils ne répondent donc pas aux mêmes besoins. Les générateurs res
 - [Présentation des générateurs](https://www.php.net/manual/fr/language.generators.overview.php), dans le manuel PHP ;
 - [Syntaxe des générateurs](https://www.php.net/manual/fr/language.generators.syntax.php) : `yield`, `yield from`, clés, valeurs renvoyées ;
 - [La classe `Generator`](https://www.php.net/manual/fr/class.generator.php) et ses méthodes (`current()`, `send()`, `throw()`...) ;
-- Doeke Norg, [Exploring Coroutines in PHP](https://doeken.org/blog/coroutines-in-php)
+- Doeke Norg, [Exploring Coroutines in PHP](https://doeken.org/blog/coroutines-in-php) (2025) : un panorama des coroutines en PHP
 - Nikita Popov, [Cooperative multitasking using coroutines (in PHP!)](https://www.npopov.com/2012/12/22/Cooperative-multitasking-using-coroutines-in-PHP.html) (2012) : la référence historique sur un ordonnanceur construit avec des générateurs, très proche de notre section 3 ;

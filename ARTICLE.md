@@ -242,17 +242,11 @@ Ce que le générateur apporte :
 Dans notre exemple précédent, on a un seul producteur et un seul consommateur ; même si notre multi-stream permet de déléguer bon nombre de traitements à d'autres générateurs via nos splitters et decoders, il reste aussi le seul point d'accès aux données, qui sont consommées par un simple foreach. 
 On n'a donc pas de notion de "communication" entre plusieurs générateurs.
 
-> Cette section présente le système de façon condensée, avec ce qui est utile pour l'ETL de la section 4. La construction pas à pas, avec le code de chaque pièce, les déroulés tour par tour et la gestion des erreurs, se trouve dans [un article à part](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_ordonnanceur.md).
+> Cette section présente le système de façon condensée, avec ce qui est utile pour l'ETL de la section 4. La construction pas à pas, avec le code de l'ordonnanceur, des déroulés tour par tour et la gestion des erreurs, se trouve dans [un article à part](https://github.com/wilzwert/generator-examples/blob/main/ARTICLE_ordonnanceur.md).
 
 > Tout ce qui suit s'inspire énormément de l'article de Nikita Popov, [Cooperative multitasking using coroutines (in PHP!)](https://www.npopov.com/2012/12/22/Cooperative-multitasking-using-coroutines-in-PHP.html), écrit en 2012 au moment de l'arrivée des générateurs dans PHP 5.5. Popov y construit une sorte de mini système d'exploitation ; je me suis concentré, dans ce projet d'apprentissage, sur la communication entre tâches : canaux de capacité limitée, contre-pression, fin de flux et détection d'interblocage.
 
-Nous allons voir ici comment on peut justement imaginer un système de coroutines coopératives très simplifié, ici pour un ETL dont le rôle sera simplement de :
-- lire un fichier CSV (une ligne à la fois)
-- valider et convertir chaque ligne en une entité métier
-- regrouper les entités métier pour traitement (batch, par 100)
-- afficher un rapport des erreurs de validation
-
-Nous allons utiliser :
+Pour construire l'ETL de la section 4, nous allons utiliser :
 - des **tâches** : des générateurs (lecture, validation/transformation, regroupement, traitement des rejets, affichage) ;
 - des **canaux** : des files dans lesquelles certaines tâches déposent des valeurs, que d'autres tâches récupèrent ;
 - des **commandes** : ce que les tâches produisent pour demander quelque chose (envoyer, recevoir, fermer un canal) ;
@@ -297,9 +291,6 @@ function consumer(Channel $in): \Generator
 }
 ```
 
-
-Le type `\Generator<int, Command, mixed, void>` (clés, valeurs produites par `yield`, valeurs reçues par `send()`, valeur de `return`) permet à PHPStan de signaler une tâche qui produirait autre chose qu'une `Command`. Cette vérification n'est que statique : l'ordonnanceur la refait à l'exécution.
-
 ### Les tâches : piloter un générateur
 
 Voyons ce que l'ordonnanceur devra faire, en pilotant nous-mêmes la tâche `consumer()` :
@@ -316,94 +307,15 @@ var_dump($task->valid());     // bool(false) : la tâche est terminée
 Ici, c'est nous qui jouons le rôle de l'ordonnanceur : on lit la commande produite, on décide de la réponse, et on relance la tâche avec. 
 Pour signaler une erreur (par exemple un envoi sur un canal fermé), on aurait appelé `throw()` à la place de `send()`.
 
-La classe `GeneratorTask` automatise ce pilotage. Elle enveloppe le générateur, mémorise son état (non démarrée, en cours, terminée), ainsi que la valeur ou l'exception à lui transmettre : l'ordonnanceur décide de la réponse à un moment donné, mais la tâche ne sera relancée que plus tard, quand son tour viendra.
-
 ### L'ordonnanceur
 
-Les tâches sont confiées à l'ordonnanceur avec sa méthode `spawn($id, $generator)`, qui enveloppe le générateur dans une `GeneratorTask` et la place dans la file d'exécution. Sa boucle principale prend la prochaine tâche de la file, la relance, et prend en charge la `Command` qu'elle a produite (version simplifiée) :
-
-```php
-public function run(): void
-{
-    while (!$this->queue->isEmpty()) {
-        $task = $this->queue->dequeue();
-        $command = $task->resume();
-
-        if (TaskStatus::DONE === $task->getStatus()) {
-            continue;
-        }
-
-        match ($command::class) {
-            Close::class => $this->handleClose($task, $command),
-            Receive::class => $this->handleReceive($task, $command),
-            Send::class => $this->handleSend($task, $command),
-        };
-    }
-
-    // tâches encore en attente : voir "Détecter l'interblocage" plus bas
-    $this->assertNoParkedTasks();
-}
-```
+L'ordonnanceur automatise ce pilotage. Les tâches lui sont confiées avec sa méthode `spawn($id, $generator)`, et sa boucle principale est simple : prendre la prochaine tâche de la file d'exécution, la relancer, puis traiter la commande qu'elle a produite.
 
 L'ordonnancement est **coopératif** : l'ordonnanceur ne peut pas interrompre une tâche, c'est elle qui rend la main avec un `yield`. Chaque tâche n'effectue qu'une action par tour, puis repasse en fin de file, pour qu'aucune ne monopolise l'exécution.
 
-Quand une commande ne peut pas être traitée tout de suite (`Send` sur un canal plein, `Receive` sur un canal vide), la tâche est **mise en attente** : l'ordonnanceur la range dans une file d'attente propre au canal, une pour les récepteurs, une pour les émetteurs (avec la valeur qu'ils veulent envoyer). Elle n'est plus relancée jusqu'à ce qu'une autre tâche fasse évoluer le canal.
+Quand une commande ne peut pas être traitée tout de suite (`Send` sur un canal plein, `Receive` sur un canal vide), la tâche est **mise en attente** dans une file propre au canal. Elle est réveillée quand une autre tâche fait évoluer le canal, et toujours avec sa commande terminée : un récepteur est réveillé avec une valeur, et la valeur d'un émetteur en attente est déposée dans le canal avant son réveil.
 
-#### Un déroulé tour par tour
-
-Deux producteurs `P1` et `P2` envoient chacun une valeur dans un canal de capacité 1, et le consommateur `C` en lit deux. Les producteurs sont lancés en premier. Les traces ont été vérifiées avec le vrai `Scheduler`.
-
-| Tour | Tâche relancée   | Commande produite | Ce que fait l'ordonnanceur                                                                          | Canal   | File d'exécution après le tour |
-|------|------------------|-------------------|-----------------------------------------------------------------------------------------------------|---------|--------------------------------|
-| 0    |                  |                   | tâches confiées dans l'ordre P1, P2, C                                                              | vide    | P1, P2, C                      |
-| 1    | P1               | `Send 'a'`        | canal pas plein : dépose `'a'` ; `P1` est réveillé                                                  | `a`     | P2, C, P1                      |
-| 2    | P2               | `Send 'b'`        | canal plein : `P2` est mis en attente, avec `'b'`                                                   | `a`     | C, P1                          |
-| 3    | C                | `Receive`         | `C` est réveillé avec `'a'` ; une place se libère : `'b'` est déposé pour `P2`, qui est réveillé    | `b`     | P1, C, P2                      |
-| 4    | P1               | aucune            | `P1` est terminée                                                                                   | `b`     | C, P2                          |
-| 5    | C (reçoit `'a'`) | `Receive`         | `C` est réveillé avec `'b'`                                                                         | vide    | P2, C                          |
-| 6    | P2               | aucune            | `P2` est terminée                                                                                   | vide    | C                              |
-| 7    | C (reçoit `'b'`) | aucune            | `C` est terminée                                                                                    | vide    | (vide)                         |
-
-La règle principale : relancer une tâche signifie que sa dernière commande est terminée. Au tour 3, l'ordonnanceur ne peut donc pas se contenter de remettre `P2` dans la file d'exécution : il doit d'abord déposer sa valeur `'b'` dans le canal, sinon elle serait perdue silencieusement. De la même façon, un récepteur en attente n'est réveillé qu'avec une valeur, la plus ancienne disponible dans le canal.
-
-Voici le traitement d'un `Send` (`answer()` mémorise la valeur de réveil de la tâche et la remet dans la file d'exécution) :
-
-```php
-private function handleSend(Task $task, Send $command): void
-{
-    $channel = $command->channel;
-
-    if ($channel->isClosed()) {
-        $this->fail($task, 'Channel closed, cannot send.');
-
-        return;
-    }
-    
-    if ($channel->isFull()) {
-        // canal plein : l'émetteur est mis en attente avec sa valeur (tour 2 du déroulé)
-        $this->parkedSendersOf($channel)->enqueue(new ParkedSender($task, $command->payload));
-
-        return;
-    }
-    
-    // dépôt de la valeur
-    $channel->push($command->payload);
-
-    if (!$this->parkedReceiversOf($channel)->isEmpty()) {
-        // si un récepteur attendait, il est réveillé avec la plus ancienne valeur du canal
-        $this->answer($this->parkedReceiversOf($channel)->dequeue(), $channel->shift());
-    }
-
-    $this->answer($task);
-}
-```
-
-
-Le traitement d'un `Receive` est le symétrique :
-- canal vide : le récepteur est mis en attente ;
-- sinon, il est réveillé avec la plus ancienne valeur, et la place libérée revient à l'émetteur qui attend depuis le plus longtemps : sa valeur est déposée, puis il est réveillé (tour 3 du déroulé).
-
-En cas d'erreur, l'ordonnanceur procède de la même façon, mais demande à la tâche d'échouer à son prochain tour : `throw()` lève l'exception au niveau de son `yield`, où elle peut la traiter, ou libérer ses ressources dans un `finally`.
+En cas d'erreur (envoi sur un canal fermé, par exemple), l'ordonnanceur demande à la tâche d'échouer à son prochain tour : `throw()` lève l'exception au niveau de son `yield`, où elle peut la traiter, ou libérer ses ressources dans un `finally`.
 
 Enfin, une tâche en attente garde tout son état (compteurs, buffers...) dans les variables locales de son générateur : l'ordonnanceur n'a rien à sauvegarder.
 
@@ -425,32 +337,7 @@ Quand la file d'exécution est vide, plus personne ne peut avancer. Il n'y a que
 - aucune tâche n'est en attente : tout est terminé, fin normale ;
 - des tâches sont encore en attente : elles ne pourront plus être réveillées. C'est un **interblocage** (deadlock).
 
-Cette détection ne coûte qu'un test après la boucle. L'ordonnanceur lève alors une exception qui liste les tâches bloquées.
-
-Exemple minimal : deux tâches qui attendent chacune une valeur de l'autre avant d'envoyer la leur.
-
-```php
-$ab = new Channel(1, 'ab'); // de A vers B
-$ba = new Channel(1, 'ba'); // de B vers A
-
-$scheduler = new Scheduler();
-$scheduler->spawn('A', (function () use ($ab, $ba): \Generator {
-    $value = yield new Receive($ba);
-    yield new Send($ab, 'pong');
-})());
-$scheduler->spawn('B', (function () use ($ab, $ba): \Generator {
-    $value = yield new Receive($ab);
-    yield new Send($ba, 'ping');
-})());
-
-$scheduler->run();
-```
-
-    Deadlock: all tasks are blocked
-      - A: waiting to receive on "ba"
-      - B: waiting to receive on "ab"
-
-Un cas plus sournois, où une seule tâche se bloque pendant que les autres avancent, est illustré sur l'ETL en section 4.
+Cette détection ne coûte qu'un test après la boucle. L'ordonnanceur lève alors une exception qui liste les tâches bloquées. On en verra un exemple sur l'ETL, en section 4.
 
 ## 4. Exemple complet : un ETL de fichier CSV avec traitement par lots
 
@@ -786,5 +673,5 @@ Les deux outils ne répondent donc pas aux mêmes besoins. Les générateurs res
 - [Présentation des générateurs](https://www.php.net/manual/fr/language.generators.overview.php), dans le manuel PHP ;
 - [Syntaxe des générateurs](https://www.php.net/manual/fr/language.generators.syntax.php) : `yield`, `yield from`, clés, valeurs renvoyées ;
 - [La classe `Generator`](https://www.php.net/manual/fr/class.generator.php) et ses méthodes (`current()`, `send()`, `throw()`...) ;
-- Doeke Norg, [Exploring Coroutines in PHP](https://doeken.org/blog/coroutines-in-php)
+- Doeke Norg, [Exploring Coroutines in PHP](https://doeken.org/blog/coroutines-in-php) (2025) : un panorama des coroutines en PHP
 - Nikita Popov, [Cooperative multitasking using coroutines (in PHP!)](https://www.npopov.com/2012/12/22/Cooperative-multitasking-using-coroutines-in-PHP.html) (2012) : la référence historique sur un ordonnanceur construit avec des générateurs, très proche de notre section 3 ;
