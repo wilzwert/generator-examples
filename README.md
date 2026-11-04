@@ -2,6 +2,27 @@
 
 PHP 8.5 playground for the generators article. One FrankenPHP container, nothing else.
 
+## Articles
+
+The articles are written in French. They use two examples to show when PHP
+generators are worth it: streaming several LLM responses at once (SSE over
+`curl_multi`), and a CSV ETL pipeline built on a small coroutine scheduler
+(tasks, bounded channels, back-pressure, deadlock detection).
+
+The main article comes in two versions, so both can be compared:
+
+| Article | Content | Reading time |
+|---------|---------|--------------|
+| [ARTICLE.md](ARTICLE.md) | Short version of the main article. Generator basics and the scheduler are condensed and moved to the two companion articles below. | ~30 min |
+| [ARTICLE_full.md](ARTICLE_full.md) | Full version of the main article, as it was before condensing: generator basics and the complete scheduler construction included. | ~45 min |
+
+Companion articles, linked from the short version:
+
+| Article | Content | Reading time |
+|---------|---------|--------------|
+| [ARTICLE_rappels.md](ARTICLE_rappels.md) | Generator basics: lazy evaluation, `send()` and `throw()`, `yield from`, cleanup with `finally`, and an array vs generator memory benchmark. | ~10 min |
+| [ARTICLE_ordonnanceur.md](ARTICLE_ordonnanceur.md) | Building the coroutine scheduler step by step: channels, tasks, scheduler code, turn-by-turn traces, end of stream and deadlock detection. | ~20 min |
+
 ## Setup
 
 ```sh
